@@ -48,6 +48,9 @@ jobs:
         run: |
           sudo apt update
           curl -sSL https://install.python-poetry.org | python3 -
+          curl -sSL https://github.com/ccache/ccache/releases/download/v4.13.6/ccache-4.13.6-linux-x86_64-glibc.tar.xz \
+          | sudo tar xJ -C /usr/local/bin --strip-components=1 ccache-4.13.6-linux-x86_64-glibc/ccache
+          echo "CCACHE_DIR=$RUNNER_TEMP/.tdesktop-cache" >> $GITHUB_ENV
           cd Telegram/build/docker/centos_env
           poetry install
           DOCKERFILE=$(DEBUG= LTO= poetry run gen_dockerfile)
@@ -56,21 +59,11 @@ jobs:
 
       - name: Libraries cache.
         id: cache-libs
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
-          path: |
-            ${{ runner.temp }}/.buildx-cache
-            ${{ runner.temp }}/.mount-cache
+          path: ${{ runner.temp }}/.buildx-cache
           key: ${{ runner.os }}-libs-${{ hashFiles('Telegram/build/docker/centos_env/**') }}
           restore-keys: ${{ runner.os }}-libs-
-
-      - name: Restore Docker cache mounts.
-        uses: reproducible-containers/buildkit-cache-dance@5422eac04292c961a382e0f584ea0f03ad9da723
-        with:
-          builder: ${{ steps.setup-buildx.outputs.name }}
-          cache-dir: ${{ runner.temp }}/.mount-cache
-          dockerfile: Telegram/build/docker/centos_env/Dockerfile
-          skip-extraction: ${{ steps.cache-libs.outputs.cache-hit }}
 
       - name: Libraries.
         uses: docker/build-push-action@v7
@@ -82,12 +75,24 @@ jobs:
           cache-to: type=local,dest=${{ runner.temp }}/.buildx-cache-new,mode=max
 
       - name: Move cache.
+        id: move-cache
         run: |
           rm -rf ${{ runner.temp }}/.buildx-cache
-          mv ${{ runner.temp }}/.buildx-cache{-new,}
+          mv ${{ runner.temp }}/.buildx-cache-new ${{ runner.temp }}/.buildx-cache
+
+      - name: Save libraries cache.
+        if: >
+          always()
+            && steps.cache-libs.outputs.cache-hit != 'true'
+            && steps.move-cache.outcome == 'success'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/.buildx-cache
+          key: ${{ steps.cache-libs.outputs.cache-primary-key }}
 
       - name: Compiler cache.
-        uses: actions/cache@v6
+        id: cache-tdesktop
+        uses: actions/cache/restore@v6
         with:
           path: ${{ runner.temp }}/.tdesktop-cache
           key: ${{ runner.os }}-tdesktop-release-${{ github.run_id }}
@@ -98,10 +103,13 @@ jobs:
           API_ID: ${{ secrets.TDESKTOP_API_ID }}
           API_HASH: ${{ secrets.TDESKTOP_API_HASH }}
         run: |
+          mkdir -p "$CCACHE_DIR"
+          ccache -z
+
           docker run --rm \
           -u $(id -u) \
           -v $PWD:/usr/src/tdesktop \
-          -v ${{ runner.temp }}/.tdesktop-cache:/var/cache/ccache \
+          -v $CCACHE_DIR:/var/cache/ccache \
           -e CONFIG=Release \
           -e KEEP_GOING=1 \
           -e CCACHE_SLOPPINESS=pch_defines,time_macros \
@@ -111,6 +119,25 @@ jobs:
           -D TDESKTOP_API_HASH=$API_HASH \
           -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON \
           -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
+
+      - name: Count ccache misses.
+        id: ccache-stats
+        if: always()
+        run: |
+          MISSES=$(ccache --print-stats | sed -n 's/^cache_miss\t//p' | head -1)
+          case "$MISSES" in (*[!0-9]*|'') MISSES=0;; esac
+          echo "misses=$MISSES" >> $GITHUB_OUTPUT
+          echo "ccache misses this run: $MISSES"
+
+      - name: Save compiler cache.
+        if: >
+          always()
+            && steps.cache-tdesktop.outputs.cache-hit != 'true'
+            && fromJSON(steps.ccache-stats.outputs.misses) > 300
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/.tdesktop-cache
+          key: ${{ steps.cache-tdesktop.outputs.cache-primary-key }}
 
       - name: Check.
         run: |
